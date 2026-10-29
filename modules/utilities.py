@@ -1,9 +1,7 @@
 import glob
 import mimetypes
 import os
-import platform
 import shutil
-import ssl
 import subprocess
 import urllib
 from pathlib import Path
@@ -11,6 +9,7 @@ from typing import List, Any
 from tqdm import tqdm
 
 import modules.globals
+from modules.model_downloader import _ssl_context
 
 TEMP_FILE = "temp.mp4"
 TEMP_DIRECTORY = "temp"
@@ -30,8 +29,12 @@ def run_ffmpeg(args: List[str]) -> bool:
     try:
         subprocess.check_output(commands, stderr=subprocess.STDOUT)
         return True
-    except Exception:
-        pass
+    except subprocess.CalledProcessError as error:
+        output = error.output.decode(errors="ignore").strip()
+        if output:
+            print(output)
+    except Exception as error:
+        print(f"ffmpeg execution failed: {error}")
     return False
 
 
@@ -48,11 +51,17 @@ def detect_fps(target_path: str) -> float:
         "default=noprint_wrappers=1:nokey=1",
         target_path,
     ]
-    output = subprocess.check_output(command).decode().strip().split("/")
     try:
+        output = subprocess.check_output(command, encoding="utf-8").strip().split("/")
         numerator, denominator = map(int, output)
         return numerator / denominator
-    except Exception:
+    except (
+        subprocess.CalledProcessError,
+        OSError,
+        UnicodeDecodeError,
+        ValueError,
+        ZeroDivisionError,
+    ):
         pass
     return 30.0
 
@@ -61,19 +70,19 @@ def extract_frames(target_path: str) -> None:
     """Extract frames with hardware acceleration and optimized settings."""
     temp_directory_path = get_temp_directory_path(target_path)
     
-    # Use hardware-accelerated decoding and optimized pixel format
+    # Write a contiguous image sequence so the later "%04d.png" input pattern
+    # used during encoding can consume every frame reliably.
     run_ffmpeg(
         [
             "-i", target_path,
             "-vf", "format=rgb24",  # Use video filter for format conversion (faster)
             "-vsync", "0",  # Prevent frame duplication
-            "-frame_pts", "1",  # Preserve frame timing
             os.path.join(temp_directory_path, "%04d.png"),
         ]
     )
 
 
-def create_video(target_path: str, fps: float = 30.0) -> None:
+def create_video(target_path: str, fps: float = 30.0) -> bool:
     """Create video with hardware-accelerated encoding and optimized settings."""
     temp_output_path = get_temp_output_path(target_path)
     temp_directory_path = get_temp_directory_path(target_path)
@@ -182,7 +191,8 @@ def create_video(target_path: str, fps: float = 30.0) -> None:
             "-y",
             temp_output_path,
         ]
-        run_ffmpeg(ffmpeg_args_fallback)
+        success = run_ffmpeg(ffmpeg_args_fallback)
+    return success and os.path.isfile(temp_output_path)
 
 
 def restore_audio(target_path: str, output_path: str) -> None:
@@ -257,11 +267,16 @@ def clean_temp(target_path: str) -> None:
 
 
 def has_image_extension(image_path: str) -> bool:
-    return image_path.lower().endswith(("png", "jpg", "jpeg"))
+    # splitext so only the real extension counts (e.g. "photo.png.bak" is not
+    # an image); the set is centralized in globals to stay in sync with dialogs.
+    return os.path.splitext(image_path)[1].lower() in modules.globals.IMAGE_EXTENSIONS
 
 
 def is_image(image_path: str) -> bool:
     if image_path and os.path.isfile(image_path):
+        # Extension check first — Windows mimetypes doesn't always register webp
+        if has_image_extension(image_path):
+            return True
         mimetype, _ = mimetypes.guess_type(image_path)
         return bool(mimetype and mimetype.startswith("image/"))
     return False
@@ -283,13 +298,10 @@ def conditional_download(download_directory_path: str, urls: List[str]) -> None:
         )
         if not os.path.exists(download_file_path):
             request = urllib.request.Request(url)
-            
-            # Create a specific SSL context for macOS to avoid globally disabling verification
-            ctx = None
-            if platform.system().lower() == "darwin":
-                ctx = ssl._create_unverified_context()
-                
-            response = urllib.request.urlopen(request, context=ctx)
+
+            # Verified TLS on every platform; never disable verification here —
+            # model files are executed by the ONNX runtime (#1890).
+            response = urllib.request.urlopen(request, context=_ssl_context())
             total = int(response.headers.get("Content-Length", 0))
             with tqdm(
                 total=total,
@@ -309,3 +321,35 @@ def conditional_download(download_directory_path: str, urls: List[str]) -> None:
 
 def resolve_relative_path(path: str) -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), path))
+
+
+def get_video_dimensions(target_path: str) -> tuple:
+    """Get video width and height using ffprobe."""
+    command = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x",
+        target_path,
+    ]
+    output = subprocess.check_output(command).decode().strip()
+    width, height = map(int, output.split("x"))
+    return width, height
+
+
+def estimate_frame_count(target_path: str, fps: float = None) -> int:
+    """Estimate total frame count from video duration and fps."""
+    if fps is None:
+        fps = detect_fps(target_path)
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        target_path,
+    ]
+    try:
+        output = subprocess.check_output(command).decode().strip()
+        duration = float(output)
+        return int(duration * fps)
+    except Exception:
+        return 0
